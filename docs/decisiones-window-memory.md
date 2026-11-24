@@ -12,9 +12,10 @@ hook por evento, porque cada hook solo admite un rango y suscribirse a rangos am
 
 | Evento | Para qué |
 | --- | --- |
-| `EVENT_SYSTEM_MOVESIZESTART` | Fija la geometría y el monitor de partida. |
-| `EVENT_SYSTEM_MOVESIZEEND` | Punto único donde se decide guardar o restaurar. |
-| `EVENT_OBJECT_LOCATIONCHANGE` | Detecta recolocaciones ajenas al arrastre. |
+| `EVENT_SYSTEM_MOVESIZESTART` | Fija la geometría y el monitor de partida del arrastre. |
+| `EVENT_SYSTEM_MOVESIZEEND` | Cierra el arrastre y decide guardar o restaurar. |
+| `EVENT_OBJECT_LOCATIONCHANGE` | Detecta movimientos y redimensionados sin arrastre. |
+| `EVENT_OBJECT_SHOW` | Registra las ventanas que aparecen con el punto de partida. |
 | `EVENT_OBJECT_DESTROY` / `EVENT_OBJECT_HIDE` | Libera el estado de la ventana. |
 
 El callback de Win32 solo comprueba que el objeto sea una ventana completa y publica
@@ -25,14 +26,30 @@ trabajo ocurre en el hilo de la interfaz, que ya tiene un bucle de mensajes.
 Se ignoran los eventos de objetos que no sean `OBJID_WINDOW` / `CHILDID_SELF`: sin esa
 condición llegarían también los cambios de posición de cada control de cada ventana.
 
-## 2. Restaurar solo al finalizar el movimiento
+## 2. Restaurar al terminar el movimiento, por las dos vías que existen
 
-Durante el arrastre no se hace nada: `MOVESIZESTART` solo registra la geometría de
-partida (`rcWork` del monitor de origen) y `LOCATIONCHANGE` se descarta mientras la
-ventana está marcada como «en movimiento». Restaurar en mitad del arrastre pelearía con
-el usuario y generaría una cascada de eventos.
+**Arrastre con el ratón.** Durante el arrastre no se hace nada: `MOVESIZESTART` solo
+registra la geometría de partida (`rcWork` del monitor de origen) y `LOCATIONCHANGE` se
+descarta mientras la ventana está marcada como «en movimiento». Restaurar en mitad del
+arrastre pelearía con el usuario y generaría una cascada de eventos.
 
-Al recibir `MOVESIZEEND`:
+**Atajos de Windows y recolocaciones.** `Win+Mayús+flecha` (mover a otro monitor),
+`Win+flecha` (ajustar a la mitad) y cualquier `SetWindowPos` externo **no generan
+`MOVESIZESTART`/`MOVESIZEEND`**: se comprobó midiendo el flujo de eventos, que solo
+contiene `EVENT_OBJECT_LOCATIONCHANGE`. Por eso existe una segunda vía:
+
+1. Al arrancar se enumeran una sola vez las ventanas visibles (`EnumWindows`) y se
+   registra su monitor y geometría; `EVENT_OBJECT_SHOW` hace lo mismo con las ventanas
+   que aparecen después. Sin ese punto de partida no se puede saber de dónde viene un
+   movimiento que no tiene eventos de arrastre.
+2. Un `LOCATIONCHANGE` que cambia de monitor no restaura en el acto: marca la ventana
+   como pendiente y arma un temporizador de asentamiento (`SETTLE_DELAY`, 350 ms) que
+   cada evento reinicia.
+3. Cuando la ventana está quieta, se vuelve a observar y se aplica la misma decisión que
+   al soltar el ratón: guardar la geometría del origen y restaurar o adaptar la del
+   destino. Un cambio de tamaño en el mismo monitor también se recuerda por esta vía.
+
+En ambos casos:
 
 1. Se descarta la ventana si ya no es supervisable (por ejemplo, acaba maximizada).
 2. Si el monitor de destino es el mismo, se guarda la geometría final sin mover nada.
@@ -42,22 +59,30 @@ Al recibir `MOVESIZEEND`:
    - si no la hay, se calcula una adaptada (sección 4) y se guarda.
 4. La geometría aplicada pasa a ser la «actual» de la ventana.
 
-La geometría de origen se toma del estado guardado en `MOVESIZESTART`, no del
+La geometría de origen se toma del estado guardado antes del movimiento, no del
 rectángulo final: ese rectángulo ya está en el monitor de destino y usarlo cambiaría el
-tamaño recordado en cada viaje de ida y vuelta.
+tamaño recordado en cada viaje de ida y vuelta. Si el usuario agarra la ventana mientras
+hay un asentamiento pendiente, el arrastre manda: `MOVESIZESTART` cancela la espera.
 
-## 3. Tres barreras contra los bucles de eventos
+Contrapartida asumida: un sistema de eventos no distingue «el usuario pulsó un atajo» de
+«la aplicación se recolocó sola». Ambos acaban en las mismas reglas; si una aplicación
+concreta se resiste, se excluye con `excluded` o se desactiva `auto_restore`.
+
+## 3. Barreras contra los bucles de eventos
 
 Una restauración provoca `EVENT_OBJECT_LOCATIONCHANGE` (y puede provocar otro
 `MOVESIZEEND` si el escritorio ajusta la ventana). Para que eso no se reinterprete como
 una acción del usuario:
 
-1. La geometría aplicada se registra como la actual de la ventana: si se repite el
-   evento, el destino ya coincide y no hay nada que hacer.
-2. `LOCATIONCHANGE` nunca restaura: solo actualiza el monitor conocido. Así, una
-   aplicación que se recoloca sola no entra en conflicto con Window Memory.
-3. Tras una restauración, la ventana queda en silencio 400 ms (`QUIET_AFTER_RESTORE`)
-   durante los cuales se descartan sus eventos.
+1. La geometría aplicada se registra como la actual de la ventana: si llega el evento
+   propio, el monitor y la geometría ya coinciden y no se arma ningún asentamiento.
+2. El asentamiento espera 350 ms desde el último evento: una animación o una secuencia
+   de varios `LOCATIONCHANGE` produce una sola decisión.
+3. Tras una restauración, la ventana queda en silencio 150 ms
+   (`QUIET_AFTER_RESTORE`) para descartar los eventos propios que aún estén en cola. El
+   margen es corto a propósito: así un segundo atajo inmediato del usuario no se pierde.
+4. Un arrastre del usuario cancela el asentamiento pendiente, de modo que nunca se
+   mezclan las dos vías.
 
 ## 4. Geometrías relativas al área de trabajo y adaptación entre monitores
 
@@ -177,7 +202,7 @@ en `window-memory.log` y no interrumpen el bucle de mensajes. Casos previstos:
 - Ventana destruida entre el evento y su procesamiento (`WindowFacts::observe`
   devuelve `None`).
 - `OpenProcess` denegado: la ventana se ignora como «ejecutable desconocido».
-- Hook que no se puede instalar: se anota cuántos de los cinco quedaron activos.
+- Hook que no se puede instalar: se anota cuántos de los seis quedaron activos.
 
 ## 12. Pruebas
 
@@ -189,22 +214,31 @@ La lógica de decisión es pura y se prueba sin crear ventanas:
   origen, redimensionado en el mismo monitor, eventos durante el arrastre, periodo de
   silencio, maximizadas, varias instancias, DPI distintos, restauración desactivada,
   utilidad desactivada, exclusiones, filtros, cambios de monitores y destrucción.
+- Movimientos sin arrastre (atajos de Windows): siembra del seguimiento, espera de
+  asentamiento, restauración al cambiar de monitor, vuelta al origen, ajuste en el mismo
+  monitor, cancelación por un arrastre posterior y olvido si la ventana desaparece.
 - `config`: valores por defecto, acotado del intervalo, lista de supervisión,
   exclusiones, `[applications.*]`, normalización de claves y TOML generado.
 
 Validación manual del escenario principal en un equipo con dos monitores (4K al 150 %
-en `DISPLAY2` y vertical al 100 % en `DISPLAY1`), arrastrando el Bloc de notas:
+en `DISPLAY2` y vertical al 100 % en `DISPLAY1`), con el Bloc de notas:
 
 | Paso | Resultado |
 | --- | --- |
 | Ventana de 700 × 900 en el vertical, en (100, 100) | Guardado como `display1`. |
 | Arrastre al 4K | Restaurada a 1050 × 1350 en (1075, 0): tamaño × 1,5 y centro proporcional. |
 | Vuelta al vertical | Restaurada exactamente a (3940, 210) con 700 × 900. |
+| `SetWindowPos` al 4K (mismo flujo que `Win+Mayús+flecha`) | Restaurada a 1050 × 1350 tras 350 ms de asentamiento. |
+| Dos movimientos seguidos separados 600 ms | Una restauración por movimiento, sin perder el segundo. |
+| `Win+flecha` real sobre otra ventana | Geometría anotada en el registro (`recordada en display2`), sin sondeos. |
 
 Una sola restauración por movimiento en el registro, sin eventos en cadena.
 
 ## 13. Limitaciones y siguientes pasos
 
+- Un sistema de eventos no distingue un movimiento pedido por el usuario (atajo de
+  Windows) de uno iniciado por la propia aplicación. Las dos vías comparten reglas; si
+  una aplicación se resiste, se excluye o se desactiva `auto_restore`.
 - Seguir ventanas maximizadas usando `rcNormalPosition` y restaurar el estado
   maximizado al volver a un monitor.
 - Recalcular geometrías al cambiar la resolución de un monitor (`WM_DISPLAYCHANGE` ya

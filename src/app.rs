@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::meta;
 use crate::panel::{self, PanelView, RowView};
 use crate::platform::{self, time};
-use crate::window_manager::{Manager, Stats, WindowFacts};
+use crate::window_manager::{Manager, Outcome, SETTLE_DELAY, Stats, WindowFacts};
 use crate::{cli, settings, strings, tray};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
@@ -23,6 +23,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_REFRESHED: u32 = WM_APP + 2;
 const WM_WINDOW_EVENT: u32 = WM_APP + 3;
 const TIMER_REFRESH: usize = 1;
+const TIMER_SETTLE: usize = 2;
 const ID_PANEL: usize = 1;
 const ID_REFRESH: usize = 2;
 const ID_TEST_NOTIFICATION: usize = 3;
@@ -652,6 +653,30 @@ fn sync_hooks(app: &App, hwnd: HWND) {
         }
         _ => {}
     }
+    drop(hooks);
+
+    if enabled {
+        let known = seed_windows(app);
+        meta::log(&format!("ventanas conocidas: {known}"));
+    }
+}
+
+/// Registra las ventanas que ya existen para poder detectar sus movimientos.
+///
+/// Un movimiento por teclado (`Win+Mayús+flecha`) solo genera cambios de
+/// posición, así que hace falta conocer el punto de partida de cada ventana.
+fn seed_windows(app: &App) -> usize {
+    let Ok(mut memory) = app.memory.try_borrow_mut() else {
+        return 0;
+    };
+    let mut known = 0;
+    for window in platform::window::top_level_windows() {
+        let facts = WindowFacts::observe(window);
+        if memory.seed(facts.as_ref()) {
+            known += 1;
+        }
+    }
+    known
 }
 
 /// Procesa un evento publicado por los hooks de ventana.
@@ -679,6 +704,17 @@ fn handle_window_event(app: &App, owner: HWND, target: HWND, event: u32) {
         Ok(mut memory) => memory.on_event(event, hwnd, facts.as_ref(), Instant::now()),
         Err(_) => return,
     };
+    apply_outcome(target, &outcome);
+    if outcome.settle {
+        arm_settle(owner);
+    }
+    if outcome.changed {
+        request_refresh(app, owner, "ventanas");
+    }
+}
+
+/// Coloca la ventana en la geometría recordada o deja constancia del motivo.
+fn apply_outcome(target: HWND, outcome: &Outcome) {
     if let Some(rect) = outcome.place {
         if platform::window::place(target, rect) {
             if let Some(detail) = &outcome.detail {
@@ -690,8 +726,39 @@ fn handle_window_event(app: &App, owner: HWND, target: HWND, event: u32) {
     } else if let Some(detail) = &outcome.detail {
         meta::log(detail);
     }
-    if outcome.changed {
-        request_refresh(app, owner, "ventanas");
+}
+
+/// Programa la comprobación de asentamiento; cada evento la reinicia.
+fn arm_settle(hwnd: HWND) {
+    unsafe {
+        let _ = SetTimer(hwnd, TIMER_SETTLE, SETTLE_DELAY.as_millis() as u32, None);
+    }
+}
+
+/// Cierra los movimientos que no generaron eventos de arrastre.
+fn settle_windows(app: &App, owner: HWND) {
+    let pending = match app.memory.try_borrow() {
+        Ok(memory) => memory.pending(),
+        Err(_) => return,
+    };
+    let mut changed = false;
+    let mut again = false;
+    for hwnd in pending {
+        let target = HWND(hwnd as *mut c_void);
+        let facts = WindowFacts::observe(target);
+        let outcome = match app.memory.try_borrow_mut() {
+            Ok(mut memory) => memory.settle(hwnd, facts.as_ref(), Instant::now()),
+            Err(_) => continue,
+        };
+        apply_outcome(target, &outcome);
+        changed |= outcome.changed;
+        again |= outcome.settle;
+    }
+    if again {
+        arm_settle(owner);
+    }
+    if changed {
+        request_refresh(app, owner, "asentamiento");
     }
 }
 
@@ -746,8 +813,13 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 LRESULT(0)
             }
             WM_TIMER => {
-                if wparam.0 == TIMER_REFRESH {
-                    request_refresh(app, hwnd, "temporizador");
+                match wparam.0 {
+                    TIMER_REFRESH => request_refresh(app, hwnd, "temporizador"),
+                    TIMER_SETTLE => {
+                        let _ = KillTimer(hwnd, TIMER_SETTLE);
+                        settle_windows(app, hwnd);
+                    }
+                    _ => {}
                 }
                 LRESULT(0)
             }
@@ -777,6 +849,7 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     let _ = DestroyIcon(HICON(handle as *mut c_void));
                 }
                 let _ = KillTimer(hwnd, TIMER_REFRESH);
+                let _ = KillTimer(hwnd, TIMER_SETTLE);
                 if let Some(panel) = app.panel.get() {
                     let _ = destroy_window(panel);
                 }

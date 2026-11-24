@@ -14,12 +14,12 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_PARENT, GW_OWNER, GWL_EXSTYLE,
-    GetAncestor, GetClassNameW, GetDesktopWindow, GetWindow, GetWindowLongW, GetWindowPlacement,
-    GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    OBJID_WINDOW, PostMessageW, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WS_EX_TOOLWINDOW,
+    EVENT_OBJECT_SHOW, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, EnumWindows,
+    GA_PARENT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindow,
+    GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, IsZoomed, OBJID_WINDOW, PostMessageW, SW_SHOWMAXIMIZED,
+    SW_SHOWMINIMIZED, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+    WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WS_EX_TOOLWINDOW,
 };
 use windows::core::PWSTR;
 
@@ -35,15 +35,18 @@ pub const EVENT_LOCATION_CHANGE: u32 = EVENT_OBJECT_LOCATIONCHANGE;
 pub const EVENT_DESTROY: u32 = EVENT_OBJECT_DESTROY;
 /// La ventana deja de ser visible.
 pub const EVENT_HIDE: u32 = EVENT_OBJECT_HIDE;
+/// La ventana aparece o vuelve a mostrarse.
+pub const EVENT_SHOW: u32 = EVENT_OBJECT_SHOW;
 
 /// Eventos a los que se suscribe Window Memory.
 ///
 /// Cada hook admite un rango de eventos; se instala uno por evento para no
 /// recibir el flujo completo de notificaciones de objetos del sistema.
-const HOOK_EVENTS: [u32; 5] = [
+const HOOK_EVENTS: [u32; 6] = [
     EVENT_MOVE_START,
     EVENT_MOVE_END,
     EVENT_LOCATION_CHANGE,
+    EVENT_SHOW,
     EVENT_DESTROY,
     EVENT_HIDE,
 ];
@@ -141,6 +144,29 @@ unsafe extern "system" fn on_event(
             LPARAM(hwnd.0 as isize),
         )
     };
+}
+
+/// Ventanas de nivel superior visibles en este momento.
+///
+/// Se usa una sola vez al arrancar para conocer el punto de partida de cada
+/// ventana; no es un sondeo periódico.
+pub fn top_level_windows() -> Vec<HWND> {
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+        let windows = unsafe { &mut *(data.0 as *mut Vec<HWND>) };
+        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            windows.push(hwnd);
+        }
+        BOOL(1)
+    }
+
+    let mut windows: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect),
+            LPARAM(&mut windows as *mut Vec<HWND> as isize),
+        );
+    }
+    windows
 }
 
 pub fn is_window(hwnd: HWND) -> bool {
@@ -289,5 +315,6 @@ mod tests {
         assert_eq!(EVENT_LOCATION_CHANGE, 0x800B);
         assert_eq!(EVENT_DESTROY, 0x8001);
         assert_eq!(EVENT_HIDE, 0x8003);
+        assert_eq!(EVENT_SHOW, 0x8002);
     }
 }

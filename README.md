@@ -35,14 +35,21 @@ cargo build --release     # target\release\window-memory.exe
 
 - **Detección por eventos.** Se instalan hooks con `SetWinEventHook`
   (`EVENT_SYSTEM_MOVESIZESTART`, `EVENT_SYSTEM_MOVESIZEEND`,
-  `EVENT_OBJECT_LOCATIONCHANGE`, `EVENT_OBJECT_DESTROY` y `EVENT_OBJECT_HIDE`) con
-  `WINEVENT_OUTOFCONTEXT`. El callback solo publica un mensaje en la ventana oculta;
-  el trabajo se hace en el hilo de la interfaz. No hay sondeos periódicos de ventanas.
-- **Restauración al soltar, no durante el arrastre.** Mientras una ventana se
-  arrastra no se toca. Al terminar el movimiento se identifica el monitor de destino:
-  si hay geometría recordada se restaura, y si no, se calcula una adaptada y se guarda.
-- **Sin bucles de eventos.** La geometría aplicada queda registrada como la actual, y
-  durante 400 ms se descartan los eventos provocados por la propia restauración.
+  `EVENT_OBJECT_LOCATIONCHANGE`, `EVENT_OBJECT_SHOW`, `EVENT_OBJECT_DESTROY` y
+  `EVENT_OBJECT_HIDE`) con `WINEVENT_OUTOFCONTEXT`. El callback solo publica un mensaje
+  en la ventana oculta; el trabajo se hace en el hilo de la interfaz. No hay sondeos
+  periódicos de ventanas.
+- **Arrastre o atajos de Windows.** Con el ratón se espera a `MOVESIZEEND`. Los atajos
+  (`Win+Mayús+flecha` para cambiar de monitor, `Win+flecha` para ajustar) y los
+  `SetWindowPos` de otras aplicaciones solo generan cambios de posición: para ellos se
+  conoce la ventana de antemano (al arrancar y al aparecer) y se decide 350 ms después
+  del último cambio, cuando la ventana ya está quieta.
+- **Restauración al soltar o al asentarse, nunca durante el movimiento.** Se identifica
+  el monitor de destino: si hay geometría recordada se restaura, y si no, se calcula una
+  adaptada y se guarda. Un cambio de tamaño en el mismo monitor también se recuerda.
+- **Sin bucles de eventos.** La geometría aplicada queda registrada como la actual, los
+  eventos propios se descartan durante 150 ms y un arrastre cancela cualquier
+  asentamiento pendiente.
 - **Geometrías relativas al área de trabajo** (`rcWork`) del monitor, no al escritorio
   virtual: sobreviven a cambios de la barra de tareas y a la disposición de monitores.
 - **DPI por monitor.** El proceso es «per-monitor aware v2». Al adaptar a un monitor
@@ -198,6 +205,9 @@ Las pruebas cubren:
 - Ventanas maximizadas, minimizadas, diálogos, ventanas hijas y de herramienta.
 - Varias instancias de la misma aplicación.
 - Prevención de bucles: eventos durante el arrastre y durante la restauración.
+- Movimientos por atajo de Windows (sin eventos de arrastre): siembra del seguimiento,
+  asentamiento, ida y vuelta entre monitores, ajuste en el mismo monitor y cancelación
+  por un arrastre posterior.
 
 ### Prueba manual del escenario principal
 
@@ -221,6 +231,10 @@ archivos.
 - Las ventanas maximizadas y minimizadas no se siguen todavía, aunque el campo
   `maximized` ya se persiste.
 - No hay editor visual de aplicaciones: la lista se edita en `config.toml`.
+- Los eventos no distinguen un movimiento pedido con los atajos de Windows de uno
+  iniciado por la propia aplicación: ambos se tratan igual. Si alguna aplicación se
+  recoloca sola y no interesa, se excluye en `config.toml` o se desactiva
+  `auto_restore`.
 - Un cambio de resolución de un monitor conserva sus geometrías; se encajan en el área
   de trabajo al restaurarse, pero no se recalculan en ese momento.
 - Las ventanas de procesos con más privilegios pueden rechazar el reposicionamiento; el

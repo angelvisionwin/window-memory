@@ -19,7 +19,14 @@ use crate::platform::window;
 use crate::window_memory::{self, Geometry, GeometryStore};
 
 /// Tiempo durante el que se descartan los eventos provocados por una restauración.
-const QUIET_AFTER_RESTORE: Duration = Duration::from_millis(400);
+///
+/// Los eventos del propio `SetWindowPos` llegan en milisegundos; el margen es
+/// corto para no perder un segundo movimiento inmediato del usuario.
+const QUIET_AFTER_RESTORE: Duration = Duration::from_millis(150);
+
+/// Margen sin cambios tras el que se da por terminado un movimiento que no
+/// genera eventos de arrastre (atajos de Windows, recolocación programática).
+pub const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 /// Clase de los cuadros de diálogo estándar de Win32.
 const DIALOG_CLASS: &str = "#32770";
@@ -182,6 +189,8 @@ pub struct Outcome {
     pub detail: Option<String>,
     /// Cambió algo relevante para la interfaz.
     pub changed: bool,
+    /// Hay que esperar a que la ventana se asiente y volver a consultarla.
+    pub settle: bool,
 }
 
 /// Estado de una ventana seguida.
@@ -192,6 +201,8 @@ struct Tracked {
     monitor: String,
     geometry: Geometry,
     moving: bool,
+    /// Cambio de posición sin eventos de arrastre, pendiente de asentar.
+    pending: bool,
     /// Fin del periodo en el que se descartan eventos propios.
     quiet_until: Option<Instant>,
 }
@@ -321,9 +332,45 @@ impl Manager {
             window::EVENT_MOVE_START => self.begin_move(facts, &mut outcome),
             window::EVENT_MOVE_END => self.end_move(facts, now, &mut outcome),
             window::EVENT_LOCATION_CHANGE => self.location_changed(facts, now, &mut outcome),
+            window::EVENT_SHOW => outcome.changed = self.seed(Some(facts)),
             _ => {}
         }
         outcome
+    }
+
+    /// Empieza a seguir una ventana que aún no se conoce.
+    ///
+    /// Se usa al arrancar y cuando una ventana aparece. Sin ese punto de partida
+    /// no se puede saber de qué monitor viene un movimiento que no genera
+    /// eventos de arrastre (por ejemplo, `Win+Mayús+flecha`).
+    pub fn seed(&mut self, facts: Option<&WindowFacts>) -> bool {
+        let Some(facts) = facts else {
+            return false;
+        };
+        if !self.config.enabled()
+            || self.windows.contains_key(&facts.hwnd)
+            || self.rejection(facts).is_some()
+        {
+            return false;
+        }
+        let Some(monitor) = self.monitor_of(facts).cloned() else {
+            return false;
+        };
+        let Some(app) = self.app_key(facts) else {
+            return false;
+        };
+        self.windows.insert(
+            facts.hwnd,
+            Tracked {
+                app,
+                monitor: monitor.key(),
+                geometry: window_memory::relative(facts.rect, monitor.work),
+                moving: false,
+                pending: false,
+                quiet_until: None,
+            },
+        );
+        true
     }
 
     fn begin_move(&mut self, facts: &WindowFacts, outcome: &mut Outcome) {
@@ -345,6 +392,7 @@ impl Manager {
             monitor: monitor.key(),
             geometry: window_memory::relative(facts.rect, monitor.work),
             moving: true,
+            pending: false,
             quiet_until: None,
         };
         if self.windows.insert(facts.hwnd, tracked).is_none() {
@@ -371,13 +419,112 @@ impl Manager {
         let Some(target) = self.monitor_of(facts).cloned() else {
             return;
         };
-        let target_key = target.key();
         let current = window_memory::relative(facts.rect, target.work);
+        self.commit_transfer(facts.hwnd, tracked, &target, current, now, outcome);
+    }
+
+    fn location_changed(&mut self, facts: &WindowFacts, now: Instant, outcome: &mut Outcome) {
+        if !self.windows.contains_key(&facts.hwnd) {
+            return;
+        }
+        let Some(monitor) = self.monitor_of(facts).cloned() else {
+            return;
+        };
+        let key = monitor.key();
+        let geometry = window_memory::relative(facts.rect, monitor.work);
+        let Some(tracked) = self.windows.get_mut(&facts.hwnd) else {
+            return;
+        };
+        if tracked.moving || tracked.quiet_until.is_some_and(|until| now < until) {
+            return;
+        }
+        if tracked.monitor == key {
+            // Mismo monitor: el tamaño final (ajustar, redimensionar) se
+            // recordará cuando la ventana deje de cambiar.
+            if tracked.geometry != geometry {
+                tracked.geometry = geometry;
+                tracked.pending = true;
+                outcome.settle = true;
+            }
+            return;
+        }
+        // Cambio de monitor sin eventos de arrastre: puede ser un atajo de
+        // Windows o una recolocación de la propia aplicación. Se espera a que la
+        // ventana se asiente para decidir, en lugar de moverla en mitad del
+        // cambio.
+        tracked.pending = true;
+        outcome.settle = true;
+        outcome.changed = true;
+    }
+
+    /// Ventanas con un cambio de posición pendiente de asentar.
+    pub fn pending(&self) -> Vec<isize> {
+        self.windows
+            .iter()
+            .filter(|(_, tracked)| tracked.pending)
+            .map(|(hwnd, _)| *hwnd)
+            .collect()
+    }
+
+    /// Cierra un cambio de posición detectado sin eventos de arrastre.
+    ///
+    /// Debe llamarse con la ventana ya en reposo: guarda la geometría que tenía
+    /// en el monitor de origen y aplica la recordada en el de destino.
+    pub fn settle(&mut self, hwnd: isize, facts: Option<&WindowFacts>, now: Instant) -> Outcome {
+        let mut outcome = Outcome::default();
+        let Some(mut tracked) = self.windows.remove(&hwnd) else {
+            return outcome;
+        };
+        if !tracked.pending {
+            self.windows.insert(hwnd, tracked);
+            return outcome;
+        }
+        tracked.pending = false;
+
+        let Some(facts) = facts else {
+            outcome.changed = true;
+            return outcome;
+        };
+        if let Some(rejection) = self.rejection(facts) {
+            outcome.changed = true;
+            outcome.detail = Some(format!("movimiento descartado: {}", rejection.reason()));
+            return outcome;
+        }
+        let Some(target) = self.monitor_of(facts).cloned() else {
+            return outcome;
+        };
+        let current = window_memory::relative(facts.rect, target.work);
+        self.commit_transfer(hwnd, tracked, &target, current, now, &mut outcome);
+        outcome
+    }
+
+    /// Guarda la geometría del monitor de origen y, si procede, aplica la del destino.
+    fn commit_transfer(
+        &mut self,
+        hwnd: isize,
+        mut tracked: Tracked,
+        target: &Monitor,
+        current: Geometry,
+        now: Instant,
+        outcome: &mut Outcome,
+    ) {
+        let target_key = target.key();
         let mut dirty = false;
 
         if target_key == tracked.monitor {
             // Mismo monitor: se recuerda el tamaño final sin mover la ventana.
-            dirty |= self.store.insert(&tracked.app, &tracked.monitor, current);
+            if self.store.insert(&tracked.app, &tracked.monitor, current) {
+                dirty = true;
+                outcome.detail = Some(format!(
+                    "{}: geometría recordada en {} ({}×{} en {}, {})",
+                    tracked.app,
+                    tracked.monitor,
+                    current.width,
+                    current.height,
+                    current.x,
+                    current.y
+                ));
+            }
             tracked.geometry = current;
         } else {
             // Se guarda la geometría que la ventana tenía en el monitor de origen,
@@ -389,7 +536,7 @@ impl Manager {
             let desired = if self.config.auto_restore() {
                 match self.store.get(&tracked.app, &target_key) {
                     Some(geometry) => Some(window_memory::clamp(geometry, target.work)),
-                    None => Some(self.adapt_to(&tracked, &target)),
+                    None => Some(self.adapt_to(&tracked, target)),
                 }
             } else {
                 None
@@ -421,37 +568,12 @@ impl Manager {
             outcome.changed = true;
         }
 
+        tracked.pending = false;
         tracked.quiet_until = Some(now + QUIET_AFTER_RESTORE);
-        self.windows.insert(facts.hwnd, tracked);
+        self.windows.insert(hwnd, tracked);
         if dirty {
             self.persist();
         }
-    }
-
-    fn location_changed(&mut self, facts: &WindowFacts, now: Instant, outcome: &mut Outcome) {
-        if !self.windows.contains_key(&facts.hwnd) {
-            return;
-        }
-        let Some(monitor) = self.monitor_of(facts).cloned() else {
-            return;
-        };
-        let key = monitor.key();
-        let geometry = window_memory::relative(facts.rect, monitor.work);
-        let Some(tracked) = self.windows.get_mut(&facts.hwnd) else {
-            return;
-        };
-        if tracked.moving || tracked.quiet_until.is_some_and(|until| now < until) {
-            return;
-        }
-        if tracked.monitor == key {
-            tracked.geometry = geometry;
-            return;
-        }
-        // Movimiento ajeno a un arrastre (la aplicación se recoloca sola): se toma
-        // nota del nuevo monitor, pero no se restaura para no pelearse con ella.
-        tracked.monitor = key;
-        tracked.geometry = geometry;
-        outcome.changed = true;
     }
 
     /// Geometría inicial para un monitor en el que la aplicación no tiene memoria.
@@ -694,9 +816,10 @@ mod tests {
             &mut manager,
             window::EVENT_LOCATION_CHANGE,
             Some(&moved),
-            now + Duration::from_secs(1) + Duration::from_millis(10),
+            now + Duration::from_secs(1) + Duration::from_millis(50),
         );
         assert_eq!(outcome.place, None);
+        assert!(!outcome.settle, "los eventos propios no deben asentarse");
 
         // Pasado el margen, un cambio de monitor se acepta sin restaurar nada.
         let elsewhere = facts(10, LEFT, Rect::new(0, 0, 900, 700));
@@ -942,6 +1065,203 @@ mod tests {
         assert!(manager.is_tracked(start.hwnd));
         manager.on_event(window::EVENT_DESTROY, start.hwnd, None, now);
         assert!(!manager.is_tracked(start.hwnd));
+    }
+
+    /// Simula lo que hacen los atajos de Windows: mover la ventana sin que se
+    /// generen eventos de arrastre, y esperar al asentamiento.
+    fn keyboard_move(
+        manager: &mut Manager,
+        start: &WindowFacts,
+        end: &WindowFacts,
+        now: Instant,
+    ) -> Outcome {
+        manager.seed(Some(start));
+        let outcome = on_facts(manager, window::EVENT_LOCATION_CHANGE, Some(end), now);
+        assert!(
+            outcome.settle,
+            "un cambio de posición sin arrastre debe esperar al asentamiento"
+        );
+        assert_eq!(outcome.place, None, "no debe moverse a mitad del cambio");
+        manager.settle(end.hwnd, Some(end), now + SETTLE_DELAY)
+    }
+
+    #[test]
+    fn keyboard_move_between_monitors_restores_and_remembers() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        let end = facts(10, RIGHT, Rect::new(4100, 300, 5300, 1000));
+
+        let outcome = keyboard_move(&mut manager, &start, &end, now);
+        let placed = outcome.place.expect("debe colocarse en el monitor destino");
+        assert_eq!(
+            manager.store.get("chrome", "display1"),
+            Some(left_geometry())
+        );
+        let remembered = manager
+            .store
+            .get("chrome", "display2")
+            .expect("debe recordarse el monitor destino");
+        assert_eq!((remembered.width, remembered.height), (1600, 1000));
+        assert_eq!(remembered.absolute(Rect::new(3840, 0, 6000, 3800)), placed);
+    }
+
+    #[test]
+    fn keyboard_move_back_restores_the_saved_geometry() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        let right = facts(10, RIGHT, Rect::new(4100, 300, 5300, 1000));
+        let placed = keyboard_move(&mut manager, &start, &right, now)
+            .place
+            .expect("debe adaptarse al ir");
+
+        let back = facts(10, LEFT, Rect::new(0, 0, 900, 700));
+        let outcome = keyboard_move(
+            &mut manager,
+            &facts(10, RIGHT, placed),
+            &back,
+            now + Duration::from_secs(10),
+        );
+        assert_eq!(outcome.place, Some(left_rect()));
+    }
+
+    #[test]
+    fn settle_without_a_pending_change_keeps_the_window() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        assert!(manager.seed(Some(&start)));
+
+        let outcome = manager.settle(10, Some(&start), now);
+        assert_eq!(outcome, Outcome::default());
+        assert_eq!(manager.stats().tracked, 1);
+        assert!(manager.pending().is_empty());
+    }
+
+    #[test]
+    fn settling_forgets_a_window_that_disappeared() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        manager.seed(Some(&start));
+        on_facts(
+            &mut manager,
+            window::EVENT_LOCATION_CHANGE,
+            Some(&facts(10, RIGHT, Rect::new(4100, 300, 5300, 1000))),
+            now,
+        );
+        assert_eq!(manager.pending(), vec![10]);
+
+        let outcome = manager.settle(10, None, now + SETTLE_DELAY);
+        assert!(outcome.changed);
+        assert_eq!(manager.stats().tracked, 0);
+    }
+
+    #[test]
+    fn keyboard_resize_on_the_same_monitor_is_remembered() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        manager.seed(Some(&start));
+
+        // Ajustar a la mitad de la pantalla (Win+flecha) no cambia de monitor.
+        let snapped = facts(10, LEFT, Rect::new(0, 0, 1920, 1060));
+        let outcome = on_facts(
+            &mut manager,
+            window::EVENT_LOCATION_CHANGE,
+            Some(&snapped),
+            now,
+        );
+        assert!(outcome.settle);
+        assert_eq!(outcome.place, None);
+
+        let outcome = manager.settle(10, Some(&snapped), now + SETTLE_DELAY);
+        assert_eq!(outcome.place, None);
+        assert_eq!(
+            manager.store.get("chrome", "display1"),
+            Some(Geometry::new(0, 0, 1920, 1060))
+        );
+    }
+
+    #[test]
+    fn keyboard_move_without_automatic_restore_only_remembers() {
+        let now = Instant::now();
+        let config = Config {
+            general: config::General {
+                auto_restore: false,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let mut manager = Manager::with_store(config, monitors(), None);
+        manager
+            .executables
+            .insert(CHROME_PID, Some("chrome.exe".to_string()));
+
+        let start = facts(10, LEFT, left_rect());
+        let end = facts(10, RIGHT, Rect::new(4100, 300, 5300, 1000));
+        let outcome = keyboard_move(&mut manager, &start, &end, now);
+        assert_eq!(outcome.place, None);
+        assert_eq!(
+            manager.store.get("chrome", "display2"),
+            Some(Geometry::new(260, 300, 1200, 700))
+        );
+    }
+
+    #[test]
+    fn seeding_skips_windows_that_are_not_supervised() {
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        assert!(manager.seed(Some(&start)));
+        assert!(!manager.seed(Some(&start)), "no se duplica el seguimiento");
+
+        let mut maximized = facts(11, LEFT, left_rect());
+        maximized.maximized = true;
+        assert!(!manager.seed(Some(&maximized)));
+
+        let excluded = Config {
+            excluded: vec!["chrome".to_string()],
+            ..Config::default()
+        };
+        let mut other = Manager::with_store(excluded, monitors(), None);
+        other
+            .executables
+            .insert(CHROME_PID, Some("chrome.exe".to_string()));
+        assert!(!other.seed(Some(&facts(12, LEFT, left_rect()))));
+    }
+
+    #[test]
+    fn a_drag_cancels_pending_settlements() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        manager.seed(Some(&start));
+
+        let moved = facts(10, RIGHT, Rect::new(4100, 300, 5300, 1000));
+        on_facts(
+            &mut manager,
+            window::EVENT_LOCATION_CHANGE,
+            Some(&moved),
+            now,
+        );
+        assert_eq!(manager.pending(), vec![10]);
+
+        // El usuario agarra la ventana antes de que se asiente: manda el arrastre.
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&moved), now);
+        assert!(manager.pending().is_empty());
+        let outcome = on_facts(
+            &mut manager,
+            window::EVENT_MOVE_END,
+            Some(&facts(10, LEFT, Rect::new(100, 100, 1700, 1100))),
+            now,
+        );
+        // El arrastre guarda la geometría que tenía en el monitor de partida.
+        assert_eq!(
+            manager.store.get("chrome", "display2"),
+            Some(Geometry::new(260, 300, 1200, 700))
+        );
+        assert!(outcome.place.is_some());
     }
 
     #[test]
