@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::meta;
 use crate::panel::{self, PanelView, RowView};
 use crate::platform::{self, time};
+use crate::window_manager::{Manager, Stats, WindowFacts};
 use crate::{cli, settings, strings, tray};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
@@ -20,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_REFRESHED: u32 = WM_APP + 2;
+const WM_WINDOW_EVENT: u32 = WM_APP + 3;
 const TIMER_REFRESH: usize = 1;
 const ID_PANEL: usize = 1;
 const ID_REFRESH: usize = 2;
@@ -27,6 +29,8 @@ const ID_TEST_NOTIFICATION: usize = 3;
 const ID_AUTOSTART: usize = 4;
 const ID_CONFIG: usize = 5;
 const ID_EXIT: usize = 6;
+const ID_MEMORY: usize = 7;
+const ID_AUTO_RESTORE: usize = 8;
 
 /// Estado de la aplicación.
 ///
@@ -38,6 +42,10 @@ const ID_EXIT: usize = 6;
 struct App {
     config: RefCell<Config>,
     view: RefCell<PanelView>,
+    /// Memoria de geometrías y seguimiento de ventanas.
+    memory: RefCell<Manager>,
+    /// Hooks de eventos; presentes solo mientras Window Memory está activo.
+    hooks: RefCell<Option<platform::window::EventHooks>>,
 
     refresh_tx: mpsc::Sender<Vec<RowView>>,
     refresh_rx: mpsc::Receiver<Vec<RowView>>,
@@ -56,8 +64,10 @@ struct App {
 impl App {
     fn new() -> App {
         let (refresh_tx, refresh_rx) = mpsc::channel();
+        let config = Config::load();
         App {
-            config: RefCell::new(Config::load()),
+            memory: RefCell::new(Manager::new(config.clone())),
+            config: RefCell::new(config),
             view: RefCell::new(PanelView {
                 title: meta::APP_NAME.to_string(),
                 subtitle: None,
@@ -68,6 +78,7 @@ impl App {
                 ),
                 rows: Vec::new(),
             }),
+            hooks: RefCell::new(None),
             refresh_tx,
             refresh_rx,
             busy: Arc::new(AtomicBool::new(false)),
@@ -304,6 +315,8 @@ pub(crate) fn run(args: cli::Args) {
             meta::log("no se pudo crear el icono de la bandeja");
         }
 
+        sync_hooks(&app, hwnd);
+
         let _ = SetTimer(
             hwnd,
             TIMER_REFRESH,
@@ -336,17 +349,69 @@ pub(crate) fn run(args: cli::Args) {
 
 /// Datos que muestra la aplicación.
 ///
-/// **Este es el punto de extensión de la plantilla**: al crear una aplicación
-/// nueva, sustituye esta función por la que produzca tus filas.
-fn snapshot(_config: &Config) -> Vec<RowView> {
-    let (hours, minutes, _) = time::local_time();
-    vec![RowView {
-        title: strings::ROW_TIME.to_string(),
-        detail: strings::ROW_TIME_DETAIL.to_string(),
-        value: format!("{hours:02}:{minutes:02}"),
-        percent: None,
-        accent: panel::Accent::for_percent(None),
-    }]
+/// El panel no sondea el escritorio: solo refleja el estado que mantienen los
+/// hooks de ventana.
+fn snapshot(stats: &Stats) -> Vec<RowView> {
+    let active = stats.enabled;
+    vec![
+        RowView {
+            title: strings::ROW_MEMORY.to_string(),
+            detail: strings::ROW_MEMORY_DETAIL.to_string(),
+            value: if active {
+                strings::STATE_ACTIVE
+            } else {
+                strings::STATE_PAUSED
+            }
+            .to_string(),
+            percent: None,
+            accent: if active {
+                panel::Accent::Ok
+            } else {
+                panel::Accent::Neutral
+            },
+        },
+        RowView {
+            title: strings::ROW_AUTO_RESTORE.to_string(),
+            detail: strings::ROW_AUTO_RESTORE_DETAIL.to_string(),
+            value: if stats.auto_restore {
+                strings::VALUE_YES
+            } else {
+                strings::VALUE_NO
+            }
+            .to_string(),
+            percent: None,
+            accent: match (active, stats.auto_restore) {
+                (false, _) => panel::Accent::Neutral,
+                (true, true) => panel::Accent::Ok,
+                (true, false) => panel::Accent::Warn,
+            },
+        },
+        RowView {
+            title: strings::ROW_WINDOWS.to_string(),
+            detail: strings::ROW_WINDOWS_DETAIL.to_string(),
+            value: stats.tracked.to_string(),
+            percent: None,
+            accent: panel::Accent::Neutral,
+        },
+        RowView {
+            title: strings::ROW_GEOMETRIES.to_string(),
+            detail: strings::ROW_GEOMETRIES_DETAIL.to_string(),
+            value: stats.geometries.to_string(),
+            percent: None,
+            accent: panel::Accent::Neutral,
+        },
+        RowView {
+            title: strings::ROW_MONITORS.to_string(),
+            detail: strings::ROW_MONITORS_DETAIL.to_string(),
+            value: stats.monitors.to_string(),
+            percent: None,
+            accent: if stats.monitors == 0 {
+                panel::Accent::Bad
+            } else {
+                panel::Accent::Neutral
+            },
+        },
+    ]
 }
 
 fn request_refresh(app: &App, hwnd: HWND, reason: &str) {
@@ -359,9 +424,12 @@ fn request_refresh(app: &App, hwnd: HWND, reason: &str) {
     let sender = app.refresh_tx.clone();
     let busy = Arc::clone(&app.busy);
     let address = hwnd.0 as isize;
-    let config = app.config_snapshot();
+    let stats = match app.memory.try_borrow() {
+        Ok(memory) => memory.stats(),
+        Err(_) => Stats::default(),
+    };
     std::thread::spawn(move || {
-        let rows = match std::panic::catch_unwind(|| snapshot(&config)) {
+        let rows = match std::panic::catch_unwind(|| snapshot(&stats)) {
             Ok(rows) => rows,
             Err(_) => {
                 meta::log("refresh: error inesperado");
@@ -432,6 +500,10 @@ fn show_panel(app: &App) {
 
 unsafe fn show_menu(app: &App, hwnd: HWND) {
     let autostart = platform::registry::autostart_enabled(meta::RUN_VALUE);
+    let (enabled, auto_restore) = match app.memory.try_borrow() {
+        Ok(memory) => (memory.enabled(), memory.auto_restore()),
+        Err(_) => (false, false),
+    };
     let items = [
         tray::MenuItem::Item {
             id: ID_PANEL,
@@ -447,6 +519,17 @@ unsafe fn show_menu(app: &App, hwnd: HWND) {
             id: ID_TEST_NOTIFICATION,
             label: strings::MENU_TEST_NOTIFICATION,
             checked: false,
+        },
+        tray::MenuItem::Separator,
+        tray::MenuItem::Item {
+            id: ID_MEMORY,
+            label: strings::MENU_MEMORY,
+            checked: enabled,
+        },
+        tray::MenuItem::Item {
+            id: ID_AUTO_RESTORE,
+            label: strings::MENU_AUTO_RESTORE,
+            checked: auto_restore,
         },
         tray::MenuItem::Separator,
         tray::MenuItem::Item {
@@ -476,6 +559,16 @@ unsafe fn show_menu(app: &App, hwnd: HWND) {
             let key = format!("test:{seq}");
             app.notify_once(hwnd, &key, strings::NOTIFY_TITLE, strings::NOTIFY_TEST_BODY);
         }
+        Some(ID_MEMORY) => {
+            update_config(app, hwnd, |config| config.general.enabled = !enabled);
+            meta::log(&format!("Window Memory activo -> {}", !enabled));
+        }
+        Some(ID_AUTO_RESTORE) => {
+            update_config(app, hwnd, |config| {
+                config.general.auto_restore = !auto_restore;
+            });
+            meta::log(&format!("restauración automática -> {}", !auto_restore));
+        }
         Some(ID_AUTOSTART) => {
             let ok = platform::registry::set_autostart(meta::RUN_VALUE, !autostart);
             meta::log(&format!("inicio con Windows -> {ok}"));
@@ -495,11 +588,27 @@ unsafe fn show_menu(app: &App, hwnd: HWND) {
     }
 }
 
+/// Cambia, guarda y aplica la configuración desde el menú de la bandeja.
+unsafe fn update_config(app: &App, hwnd: HWND, change: impl FnOnce(&mut Config)) {
+    let mut config = app.config_snapshot();
+    change(&mut config);
+    if let Err(error) = config.save() {
+        meta::log(&format!("config: no se pudo guardar: {error}"));
+    }
+    unsafe {
+        apply_config(app, hwnd, config);
+    }
+}
+
 /// Aplica en caliente la configuración guardada desde el diálogo.
 unsafe fn apply_config(app: &App, hwnd: HWND, updated: Config) {
     if let Ok(mut config) = app.config.try_borrow_mut() {
         *config = updated.clone();
     }
+    if let Ok(mut memory) = app.memory.try_borrow_mut() {
+        memory.apply_config(updated.clone());
+    }
+    sync_hooks(app, hwnd);
 
     let title = windows::core::HSTRING::from(meta::APP_NAME);
     let _ = SetWindowTextW(hwnd, &title);
@@ -515,10 +624,57 @@ unsafe fn apply_config(app: &App, hwnd: HWND, updated: Config) {
         None,
     );
     meta::log(&format!(
-        "configuración aplicada — refresco {}s",
+        "configuración aplicada — Window Memory {}, restauración {}, refresco {}s",
+        if updated.enabled() {
+            "activo"
+        } else {
+            "pausado"
+        },
+        if updated.auto_restore() { "sí" } else { "no" },
         updated.refresh_interval_secs()
     ));
     request_refresh(app, hwnd, "configuración");
+}
+
+/// Instala o retira los hooks de ventana según el estado de Window Memory.
+fn sync_hooks(app: &App, hwnd: HWND) {
+    let enabled = app.memory.borrow().enabled();
+    let mut hooks = app.hooks.borrow_mut();
+    match (enabled, hooks.is_some()) {
+        (true, false) => {
+            let installed = platform::window::EventHooks::install(hwnd, WM_WINDOW_EVENT);
+            meta::log(&format!("hooks de ventana: {}", installed.count()));
+            *hooks = Some(installed);
+        }
+        (false, true) => {
+            *hooks = None;
+            meta::log("hooks de ventana retirados");
+        }
+        _ => {}
+    }
+}
+
+/// Procesa un evento publicado por los hooks de ventana.
+fn handle_window_event(app: &App, owner: HWND, target: HWND, event: u32) {
+    let facts = WindowFacts::observe(target);
+    let outcome = match app.memory.try_borrow_mut() {
+        Ok(mut memory) => memory.on_event(event, facts.as_ref(), Instant::now()),
+        Err(_) => return,
+    };
+    if let Some(rect) = outcome.place {
+        if platform::window::place(target, rect) {
+            if let Some(detail) = &outcome.detail {
+                meta::log(&format!("restaurada {detail}"));
+            }
+        } else {
+            meta::log("no se pudo colocar la ventana en la geometría recordada");
+        }
+    } else if let Some(detail) = &outcome.detail {
+        meta::log(detail);
+    }
+    if outcome.changed {
+        request_refresh(app, owner, "ventanas");
+    }
 }
 
 extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -577,7 +733,24 @@ extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 }
                 LRESULT(0)
             }
+            WM_WINDOW_EVENT => {
+                handle_window_event(app, hwnd, HWND(lparam.0 as *mut c_void), wparam.0 as u32);
+                LRESULT(0)
+            }
+            WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+                let changed = match app.memory.try_borrow_mut() {
+                    Ok(mut memory) => memory.refresh_monitors(),
+                    Err(_) => false,
+                };
+                if changed {
+                    meta::log("disposición de monitores actualizada");
+                    request_refresh(app, hwnd, "monitores");
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                // Los hooks deben retirarse en el hilo que los instaló.
+                *app.hooks.borrow_mut() = None;
                 if !tray::remove(hwnd) {
                     meta::log("no se pudo quitar el icono de la bandeja");
                 }
@@ -651,8 +824,8 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 // --------------------------- modo consola ---------------------------
 
 fn dump() {
-    let config = Config::load();
-    let rows = snapshot(&config);
+    let manager = Manager::new(Config::load());
+    let rows = snapshot(&manager.stats());
     platform::console::print_line(&to_json(&rows));
 }
 

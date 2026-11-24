@@ -11,26 +11,33 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, ES_NUMBER, ES_RIGHT, GWLP_USERDATA, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, IDC_ARROW, IsDialogMessageW, IsWindow, LoadCursorW, MSG,
-    PostQuitMessage, RegisterClassW, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WNDCLASSW,
-    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_NUMBER, ES_RIGHT,
+    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, IDC_ARROW, IsDialogMessageW,
+    IsWindow, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WNDCLASSW, WS_CAPTION, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
-use crate::config::Config;
+use crate::config::{Config, General};
 use crate::meta;
 use crate::platform::dialog::{self, SS_CENTERIMAGE};
 use crate::strings;
 
 const ID_REFRESH: i32 = 101;
 const ID_FOLDER: i32 = 102;
+const ID_MEMORY: i32 = 103;
+const ID_AUTO_RESTORE: i32 = 104;
 // IDOK e IDCANCEL: `IsDialogMessageW` envía estos identificadores con Intro y Escape.
 const ID_SAVE: i32 = 1;
 const ID_CANCEL: i32 = 2;
+
+// `BST_UNCHECKED` y `BST_CHECKED`: valores de un botón de verificación.
+const BUTTON_UNCHECKED: usize = 0;
+const BUTTON_CHECKED: usize = 1;
 
 const WIDTH: f32 = 380.0;
 const MARGIN: f32 = 16.0;
@@ -40,6 +47,8 @@ const BUTTON: f32 = 28.0;
 
 #[derive(Clone, Copy)]
 struct Controls {
+    memory: HWND,
+    auto_restore: HWND,
     refresh: HWND,
     font: HFONT,
 }
@@ -129,7 +138,9 @@ pub unsafe fn open(parent: HWND, current: Config) -> Option<Config> {
     let right = client_width - m;
     let label_width = right - m - px(NUMBER) - px(12.0);
 
-    let y_field = m;
+    let y_memory = m;
+    let y_auto = y_memory + row + px(6.0);
+    let y_field = y_auto + row + px(14.0);
     let y_buttons = y_field + row + px(28.0);
     let client_height = y_buttons + px(BUTTON) + m;
 
@@ -162,6 +173,28 @@ pub unsafe fn open(parent: HWND, current: Config) -> Option<Config> {
     let font = dialog::font(px(12.0), 400);
 
     let controls = (|| -> Option<Controls> {
+        let check = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
+        let memory = dialog::child(
+            dialog_hwnd,
+            w!("BUTTON"),
+            strings::SETTINGS_MEMORY,
+            check,
+            WINDOW_EX_STYLE(0),
+            dialog::rect(m, y_memory, right - m, row),
+            ID_MEMORY,
+            font,
+        )?;
+        let auto_restore = dialog::child(
+            dialog_hwnd,
+            w!("BUTTON"),
+            strings::SETTINGS_AUTO_RESTORE,
+            check,
+            WINDOW_EX_STYLE(0),
+            dialog::rect(m, y_auto, right - m, row),
+            ID_AUTO_RESTORE,
+            font,
+        )?;
+
         dialog::child(
             dialog_hwnd,
             w!("STATIC"),
@@ -230,7 +263,12 @@ pub unsafe fn open(parent: HWND, current: Config) -> Option<Config> {
             font,
         )?;
 
-        Some(Controls { refresh, font })
+        Some(Controls {
+            memory,
+            auto_restore,
+            refresh,
+            font,
+        })
     })();
 
     let Some(controls) = controls else {
@@ -255,6 +293,8 @@ pub unsafe fn open(parent: HWND, current: Config) -> Option<Config> {
         controls.refresh,
         &current.refresh_interval_secs().to_string(),
     );
+    set_checked(controls.memory, current.enabled());
+    set_checked(controls.auto_restore, current.auto_restore());
 
     let _ = EnableWindow(parent, false);
     let _ = ShowWindow(dialog_hwnd, SW_SHOW);
@@ -344,7 +384,12 @@ unsafe fn save(hwnd: HWND) {
     };
 
     let config = Config {
+        general: General {
+            enabled: is_checked(state.controls.memory),
+            auto_restore: is_checked(state.controls.auto_restore),
+        },
         refresh_seconds: refresh,
+        ..state.current.clone()
     };
 
     if let Err(error) = config.save() {
@@ -373,6 +418,20 @@ fn parse_number(text: &str, fallback: u64) -> Option<u64> {
         return Some(fallback);
     }
     text.parse().ok()
+}
+
+fn set_checked(hwnd: HWND, checked: bool) {
+    let state = if checked {
+        BUTTON_CHECKED
+    } else {
+        BUTTON_UNCHECKED
+    };
+    unsafe { SendMessageW(hwnd, BM_SETCHECK, WPARAM(state), LPARAM(0)) };
+}
+
+fn is_checked(hwnd: HWND) -> bool {
+    let state = unsafe { SendMessageW(hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)) };
+    state.0 as usize == BUTTON_CHECKED
 }
 
 #[cfg(test)]

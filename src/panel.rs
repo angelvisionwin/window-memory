@@ -37,18 +37,6 @@ pub enum Accent {
     Bad,
 }
 
-impl Accent {
-    /// Acento sugerido a partir de un porcentaje de uso.
-    pub fn for_percent(percent: Option<u8>) -> Accent {
-        match percent {
-            Some(value) if value >= 90 => Accent::Bad,
-            Some(value) if value >= 75 => Accent::Warn,
-            Some(_) => Accent::Ok,
-            None => Accent::Neutral,
-        }
-    }
-}
-
 /// Una fila del panel, con los textos ya resueltos por la aplicación.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowView {
