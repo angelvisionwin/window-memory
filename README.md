@@ -182,6 +182,10 @@ src/
 
 `platform` no importa módulos de la aplicación: solo depende del crate `windows`.
 
+El icono está en `assets/app.ico`, con tamaños de 16 a 256 px (la bandeja usa 16–24 y
+el explorador hasta 256). Se puede regenerar con `python assets/make_icon.py`, que
+requiere Pillow; `build.rs` lo incrusta como recurso 1 del ejecutable.
+
 `window_manager::Manager` recibe hechos de ventana ya resueltos (`WindowFacts`) y
 devuelve un `Outcome` con el rectángulo a aplicar, así que toda la lógica de decisión
 se prueba sin tocar el escritorio real. El panel no sondea nada: `snapshot()` refleja

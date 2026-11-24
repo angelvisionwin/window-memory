@@ -2,6 +2,7 @@ include!("identity.rs");
 
 fn main() {
     println!("cargo:rerun-if-changed=identity.rs");
+    println!("cargo:rerun-if-changed=assets/app.ico");
 
     #[cfg(target_os = "windows")]
     {
