@@ -17,7 +17,7 @@ include!("../identity.rs");
 pub const APP_NAME: &str = DISPLAY_NAME;
 
 /// Identificador interno sin acentos: base de las clases, del mutex y de la carpeta de datos.
-pub const APP_ID: &str = "TrayApp";
+pub const APP_ID: &str = "WindowMemory";
 
 /// Versión del paquete, definida en `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,20 +28,23 @@ pub const DATA_DIR_NAME: &str = APP_ID;
 /// Archivo de configuración dentro de la carpeta de datos.
 pub const CONFIG_FILE: &str = "config.toml";
 
+/// Archivo de geometrías recordadas, generado por la aplicación.
+pub const GEOMETRY_FILE: &str = "geometries.toml";
+
 /// Valor de `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
-pub const RUN_VALUE: &str = "TrayApp";
+pub const RUN_VALUE: &str = "WindowMemory";
 
 /// Ventana oculta que posee el icono de la bandeja.
-pub const WINDOW_CLASS_MAIN: PCWSTR = w!("TrayAppTrayWnd");
+pub const WINDOW_CLASS_MAIN: PCWSTR = w!("WindowMemoryTrayWnd");
 
 /// Ventana del panel.
-pub const WINDOW_CLASS_PANEL: PCWSTR = w!("TrayAppPanelWnd");
+pub const WINDOW_CLASS_PANEL: PCWSTR = w!("WindowMemoryPanelWnd");
 
 /// Ventana del diálogo de configuración.
-pub const WINDOW_CLASS_SETTINGS: PCWSTR = w!("TrayAppSettingsWnd");
+pub const WINDOW_CLASS_SETTINGS: PCWSTR = w!("WindowMemorySettingsWnd");
 
 /// Mutex de instancia única, en el espacio de nombres `Local`.
-pub const MUTEX_NAME: PCWSTR = w!("Local\\TrayAppMutex");
+pub const MUTEX_NAME: PCWSTR = w!("Local\\WindowMemoryMutex");
 
 /// Nombre del archivo de log, derivado del nombre del ejecutable.
 pub fn log_file() -> String {

@@ -1,5 +1,5 @@
 #![windows_subsystem = "windows"]
 
 fn main() {
-    desktop_template::run();
+    window_memory::run();
 }

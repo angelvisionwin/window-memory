@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN: tray-app.exe
+  BIN: window-memory.exe
 
 jobs:
   audit:
@@ -72,7 +72,7 @@ jobs:
 
           $version = (& $exe --version | Out-String).Trim()
           Write-Host "version: $version"
-          if (-not $version.StartsWith("tray-app ")) { throw "salida de --version inesperada" }
+          if (-not $version.StartsWith("window-memory ")) { throw "salida de --version inesperada" }
       - name: Sumas de verificación
         shell: pwsh
         run: |
@@ -81,9 +81,9 @@ jobs:
           Get-Content target/release/SHA256SUMS.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: tray-app-windows-x64
+          name: window-memory-windows-x64
           path: |
-            target/release/tray-app.exe
+            target/release/window-memory.exe
             target/release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
@@ -110,6 +110,6 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
-            target/release/tray-app.exe
+            target/release/window-memory.exe
             target/release/SHA256SUMS.txt
           generate_release_notes: true
