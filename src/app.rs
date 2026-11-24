@@ -656,9 +656,27 @@ fn sync_hooks(app: &App, hwnd: HWND) {
 
 /// Procesa un evento publicado por los hooks de ventana.
 fn handle_window_event(app: &App, owner: HWND, target: HWND, event: u32) {
-    let facts = WindowFacts::observe(target);
+    let hwnd = target.0 as isize;
+    let facts = match event {
+        // Una ventana destruida u oculta ya no se puede observar: solo interesa
+        // su identificador para dejar de seguirla.
+        platform::window::EVENT_DESTROY | platform::window::EVENT_HIDE => None,
+        // El resto de movimientos del sistema no se consultan si no se sigue la
+        // ventana: evita trabajo inútil en cada animación del escritorio.
+        platform::window::EVENT_LOCATION_CHANGE => {
+            let tracked = app
+                .memory
+                .try_borrow()
+                .is_ok_and(|memory| memory.is_tracked(hwnd));
+            if !tracked {
+                return;
+            }
+            WindowFacts::observe(target)
+        }
+        _ => WindowFacts::observe(target),
+    };
     let outcome = match app.memory.try_borrow_mut() {
-        Ok(mut memory) => memory.on_event(event, target.0 as isize, facts.as_ref(), Instant::now()),
+        Ok(mut memory) => memory.on_event(event, hwnd, facts.as_ref(), Instant::now()),
         Err(_) => return,
     };
     if let Some(rect) = outcome.place {

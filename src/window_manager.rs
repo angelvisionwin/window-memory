@@ -254,6 +254,14 @@ impl Manager {
         self.config.enabled()
     }
 
+    /// `true` si la ventana está siendo seguida.
+    ///
+    /// Permite descartar los cambios de posición del resto del sistema sin
+    /// consultar Win32.
+    pub fn is_tracked(&self, hwnd: isize) -> bool {
+        self.windows.contains_key(&hwnd)
+    }
+
     pub fn auto_restore(&self) -> bool {
         self.config.auto_restore()
     }
@@ -922,6 +930,18 @@ mod tests {
         // Un segundo aviso ya no cambia nada.
         let outcome = manager.on_event(window::EVENT_DESTROY, 10, None, now);
         assert!(!outcome.changed);
+    }
+
+    #[test]
+    fn tracked_windows_are_reported_for_event_filtering() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        assert!(!manager.is_tracked(start.hwnd));
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
+        assert!(manager.is_tracked(start.hwnd));
+        manager.on_event(window::EVENT_DESTROY, start.hwnd, None, now);
+        assert!(!manager.is_tracked(start.hwnd));
     }
 
     #[test]
