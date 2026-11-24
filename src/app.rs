@@ -658,7 +658,7 @@ fn sync_hooks(app: &App, hwnd: HWND) {
 fn handle_window_event(app: &App, owner: HWND, target: HWND, event: u32) {
     let facts = WindowFacts::observe(target);
     let outcome = match app.memory.try_borrow_mut() {
-        Ok(mut memory) => memory.on_event(event, facts.as_ref(), Instant::now()),
+        Ok(mut memory) => memory.on_event(event, target.0 as isize, facts.as_ref(), Instant::now()),
         Err(_) => return,
     };
     if let Some(rect) = outcome.place {

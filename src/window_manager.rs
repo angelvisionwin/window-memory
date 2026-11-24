@@ -283,14 +283,26 @@ impl Manager {
         true
     }
 
-    /// Procesa un evento del sistema para la ventana observada en `facts`.
-    pub fn on_event(&mut self, event: u32, facts: Option<&WindowFacts>, now: Instant) -> Outcome {
+    /// Procesa un evento del sistema para la ventana `hwnd`.
+    ///
+    /// `facts` es `None` cuando la ventana ya no existe; aun así hay que olvidarla.
+    pub fn on_event(
+        &mut self,
+        event: u32,
+        hwnd: isize,
+        facts: Option<&WindowFacts>,
+        now: Instant,
+    ) -> Outcome {
         let mut outcome = Outcome::default();
         if !self.config.enabled() {
             if !self.windows.is_empty() {
                 self.windows.clear();
                 outcome.changed = true;
             }
+            return outcome;
+        }
+        if matches!(event, window::EVENT_DESTROY | window::EVENT_HIDE) {
+            outcome.changed = self.windows.remove(&hwnd).is_some();
             return outcome;
         }
         let Some(facts) = facts else {
@@ -301,9 +313,6 @@ impl Manager {
             window::EVENT_MOVE_START => self.begin_move(facts, &mut outcome),
             window::EVENT_MOVE_END => self.end_move(facts, now, &mut outcome),
             window::EVENT_LOCATION_CHANGE => self.location_changed(facts, now, &mut outcome),
-            window::EVENT_DESTROY | window::EVENT_HIDE => {
-                outcome.changed = self.windows.remove(&facts.hwnd).is_some();
-            }
             _ => {}
         }
         outcome
@@ -559,14 +568,25 @@ mod tests {
         end: &WindowFacts,
         now: Instant,
     ) -> Outcome {
-        manager.on_event(window::EVENT_MOVE_START, Some(start), now);
-        manager.on_event(
+        on_facts(manager, window::EVENT_MOVE_START, Some(start), now);
+        on_facts(
+            manager,
             window::EVENT_MOVE_END,
             Some(end),
             now + Duration::from_secs(1),
         )
     }
 
+    /// Variante de `Manager::on_event` para las pruebas con hechos opcionales.
+    fn on_facts(
+        manager: &mut Manager,
+        event: u32,
+        facts: Option<&WindowFacts>,
+        now: Instant,
+    ) -> Outcome {
+        let hwnd = facts.map(|value| value.hwnd).unwrap_or_default();
+        manager.on_event(event, hwnd, facts, now)
+    }
     #[test]
     fn moving_to_another_monitor_adapts_and_remembers() {
         let now = Instant::now();
@@ -631,10 +651,11 @@ mod tests {
         let now = Instant::now();
         let mut manager = manager();
         let start = facts(10, LEFT, left_rect());
-        manager.on_event(window::EVENT_MOVE_START, Some(&start), now);
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
 
         let halfway = facts(10, RIGHT, Rect::new(4000, 200, 5600, 1200));
-        let outcome = manager.on_event(
+        let outcome = on_facts(
+            &mut manager,
             window::EVENT_LOCATION_CHANGE,
             Some(&halfway),
             now + Duration::from_millis(100),
@@ -643,7 +664,8 @@ mod tests {
         assert!(!outcome.changed);
 
         // Al soltar, se restaura una sola vez.
-        let outcome = manager.on_event(
+        let outcome = on_facts(
+            &mut manager,
             window::EVENT_MOVE_END,
             Some(&halfway),
             now + Duration::from_millis(200),
@@ -660,7 +682,8 @@ mod tests {
         drag(&mut manager, &start, &end, now);
 
         let moved = facts(10, RIGHT, Rect::new(3900, 0, 5500, 1000));
-        let outcome = manager.on_event(
+        let outcome = on_facts(
+            &mut manager,
             window::EVENT_LOCATION_CHANGE,
             Some(&moved),
             now + Duration::from_secs(1) + Duration::from_millis(10),
@@ -669,7 +692,8 @@ mod tests {
 
         // Pasado el margen, un cambio de monitor se acepta sin restaurar nada.
         let elsewhere = facts(10, LEFT, Rect::new(0, 0, 900, 700));
-        let outcome = manager.on_event(
+        let outcome = on_facts(
+            &mut manager,
             window::EVENT_LOCATION_CHANGE,
             Some(&elsewhere),
             now + Duration::from_secs(5),
@@ -683,11 +707,12 @@ mod tests {
         let now = Instant::now();
         let mut manager = manager();
         let start = facts(10, LEFT, left_rect());
-        manager.on_event(window::EVENT_MOVE_START, Some(&start), now);
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
 
         let mut maximized = facts(10, RIGHT, Rect::new(3840, 0, 6000, 2120));
         maximized.maximized = true;
-        let outcome = manager.on_event(
+        let outcome = on_facts(
+            &mut manager,
             window::EVENT_MOVE_END,
             Some(&maximized),
             now + Duration::from_secs(1),
@@ -800,7 +825,7 @@ mod tests {
             .insert(CHROME_PID, Some("chrome.exe".to_string()));
 
         let start = facts(10, LEFT, left_rect());
-        manager.on_event(window::EVENT_MOVE_START, Some(&start), now);
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
         assert_eq!(manager.stats().tracked, 0);
     }
 
@@ -861,7 +886,7 @@ mod tests {
         let now = Instant::now();
         let mut manager = manager();
         let start = facts(10, LEFT, left_rect());
-        manager.on_event(window::EVENT_MOVE_START, Some(&start), now);
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
         assert_eq!(manager.stats().tracked, 1);
 
         let only_left = MonitorSet::from_list(vec![monitors().list()[0].clone()]);
@@ -870,7 +895,8 @@ mod tests {
 
         // Al desaparecer el monitor donde estaba la ventana, deja de seguirse.
         let right = monitors().list()[1].clone();
-        manager.on_event(
+        on_facts(
+            &mut manager,
             window::EVENT_LOCATION_CHANGE,
             Some(&facts(11, RIGHT, Rect::new(3900, 0, 5500, 1000))),
             now,
@@ -881,16 +907,33 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_window_forgets_it() {
+    fn destroyed_windows_are_forgotten_even_without_facts() {
         let now = Instant::now();
         let mut manager = manager();
         let start = facts(10, LEFT, left_rect());
-        manager.on_event(window::EVENT_MOVE_START, Some(&start), now);
-        let outcome = manager.on_event(
-            window::EVENT_DESTROY,
-            Some(&facts(10, LEFT, left_rect())),
-            now,
-        );
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
+        assert_eq!(manager.stats().tracked, 1);
+
+        // Al destruirse, la ventana ya no existe: el evento llega sin hechos.
+        let outcome = manager.on_event(window::EVENT_DESTROY, 10, None, now);
+        assert!(outcome.changed);
+        assert_eq!(manager.stats().tracked, 0);
+
+        // Un segundo aviso ya no cambia nada.
+        let outcome = manager.on_event(window::EVENT_DESTROY, 10, None, now);
+        assert!(!outcome.changed);
+    }
+
+    #[test]
+    fn hidden_windows_stop_being_tracked() {
+        let now = Instant::now();
+        let mut manager = manager();
+        let start = facts(10, LEFT, left_rect());
+        on_facts(&mut manager, window::EVENT_MOVE_START, Some(&start), now);
+
+        let mut hidden = facts(10, LEFT, left_rect());
+        hidden.visible = false;
+        let outcome = on_facts(&mut manager, window::EVENT_HIDE, Some(&hidden), now);
         assert!(outcome.changed);
         assert_eq!(manager.stats().tracked, 0);
     }
