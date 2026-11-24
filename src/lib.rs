@@ -1,4 +1,5 @@
-//! Plantilla de aplicación de escritorio Win32.
+//! Window Memory: recuerda el tamaño y la posición de las ventanas de cada
+//! aplicación en cada monitor.
 //!
 //! El ejecutable solo llama a [`run`]; todo lo demás es interno.
 
@@ -13,6 +14,8 @@ pub(crate) mod platform;
 pub(crate) mod settings;
 pub(crate) mod strings;
 pub(crate) mod tray;
+pub(crate) mod window_manager;
+pub(crate) mod window_memory;
 
 /// Ejecuta la aplicación.
 pub fn run() {
